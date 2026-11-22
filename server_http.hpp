@@ -139,6 +139,13 @@ namespace SimpleWeb {
         return streambuf->size();
       }
 
+      /// Abort an unsent response when its application-level output reservation is refused.
+      void abort() noexcept {
+        close_connection_after_response = true;
+        auto connection = session->connection;
+        post(connection->write_strand, [connection] { connection->close(); });
+      }
+
       /// Send the content of the response stream to client. The callback is called when the send has completed.
       ///
       /// Use this function if you need to recursively send parts of a longer message, or when using server-sent events.
@@ -232,13 +239,28 @@ namespace SimpleWeb {
       std::weak_ptr<Connection> connection;
       std::string optimization = std::to_string(0); // TODO: figure out what goes wrong in gcc optimization without this line
 
-      Request(std::size_t max_request_streambuf_size, const std::shared_ptr<Connection> &connection_) noexcept
-          : streambuf(new asio::streambuf(max_request_streambuf_size)), content_streambuf(max_request_streambuf_size), connection(connection_), content(content_streambuf) {}
-      Request(std::size_t max_request_streambuf_size, const std::shared_ptr<Connection> &connection_, std::unique_ptr<asio::streambuf> &&previous_streambuf) noexcept
+      Request(std::size_t max_request_streambuf_size, const std::shared_ptr<Connection> &connection_, std::size_t max_header_size) noexcept
+          : streambuf(new asio::streambuf(std::min(max_request_streambuf_size, max_header_size))), content_streambuf(max_request_streambuf_size), connection(connection_), content(content_streambuf) {}
+      Request(std::size_t max_request_streambuf_size, const std::shared_ptr<Connection> &connection_, std::unique_ptr<asio::streambuf> &&previous_streambuf, std::size_t) noexcept
           : streambuf(std::move(previous_streambuf)), content_streambuf(max_request_streambuf_size), connection(connection_), content(content_streambuf) {
       }
 
     public:
+      /// Application lease retained by Session/Response until the asynchronous send completes.
+      std::shared_ptr<void> admission_context;
+      /// Reserve output copies before an application writes into the response stream buffer.
+      std::function<bool(std::size_t)> reserve_response;
+      /// Exact bounded header block for an application's strict framing validation.
+      std::string raw_header;
+      /// Attach a lease to the connection, including keep-alive/header and TLS lifetimes.
+      void connection_context(std::shared_ptr<void> context) {
+        if(auto owner = connection.lock()) owner->admission_context = std::move(context);
+      }
+      /// Return the application connection lease, if this socket is still alive.
+      std::shared_ptr<void> connection_context() const {
+        if(auto owner = connection.lock()) return owner->admission_context;
+        return {};
+      }
       std::string method, path, query_string, http_version;
 
       Content content;
@@ -308,6 +330,7 @@ namespace SimpleWeb {
       std::shared_ptr<ScopeRunner> handler_runner;
 
       std::unique_ptr<socket_type> socket; // Socket must be unique_ptr since asio::ssl::stream<asio::ip::tcp::socket> is not movable
+      std::shared_ptr<void> admission_context; // Optional application connection lease.
 
       /**
        * Needed for TLS communication where async_write could be called outside of the io_context runners.
@@ -352,10 +375,10 @@ namespace SimpleWeb {
 
     class Session {
     public:
-      Session(std::size_t max_request_streambuf_size, std::shared_ptr<Connection> connection_) noexcept
-          : connection(std::move(connection_)), request(new Request(max_request_streambuf_size, connection)) {}
-      Session(std::size_t max_request_streambuf_size, std::shared_ptr<Connection> connection_, std::unique_ptr<asio::streambuf> &&previous_streambuf) noexcept
-          : connection(std::move(connection_)), request(new Request(max_request_streambuf_size, connection, std::move(previous_streambuf))) {}
+      Session(std::size_t max_request_streambuf_size, std::shared_ptr<Connection> connection_, std::size_t max_header_size = (std::numeric_limits<std::size_t>::max)()) noexcept
+          : connection(std::move(connection_)), request(new Request(max_request_streambuf_size, connection, max_header_size)) {}
+      Session(std::size_t max_request_streambuf_size, std::shared_ptr<Connection> connection_, std::unique_ptr<asio::streambuf> &&previous_streambuf, std::size_t max_header_size = (std::numeric_limits<std::size_t>::max)()) noexcept
+          : connection(std::move(connection_)), request(new Request(max_request_streambuf_size, connection, std::move(previous_streambuf), max_header_size)) {}
 
       std::shared_ptr<Connection> connection;
       std::shared_ptr<Request> request;
@@ -380,6 +403,8 @@ namespace SimpleWeb {
       /// Maximum size of request stream buffer. Defaults to architecture maximum.
       /// Reaching this limit will result in a message_size error code.
       std::size_t max_request_streambuf_size = (std::numeric_limits<std::size_t>::max)();
+      /// Independent bound for read_until(header delimiter), before body admission.
+      std::size_t max_request_header_size = (std::numeric_limits<std::size_t>::max)();
       /// IPv4 address in dotted decimal form or IPv6 address in hexadecimal notation.
       /// If empty, the address will be any address.
       std::string address;
@@ -413,6 +438,10 @@ namespace SimpleWeb {
 
     /// Called when an error occurs.
     std::function<void(std::shared_ptr<typename ServerBase<socket_type>::Request>, const error_code &)> on_error;
+    /// Optional admission hooks; false closes the socket before further buffering/processing.
+    std::function<bool(std::shared_ptr<Request>)> on_connection_accepted;
+    std::function<bool(std::shared_ptr<Request>)> on_connection_authenticated;
+    std::function<bool(std::shared_ptr<Request>)> on_request_header;
 
     /// Called on upgrade requests.
     std::function<void(std::unique_ptr<socket_type> &, std::shared_ptr<typename ServerBase<socket_type>::Request>)> on_upgrade;
@@ -580,11 +609,22 @@ namespace SimpleWeb {
           // streambuf (maybe some bytes of the content) is appended to in the async_read-function below (for retrieving content).
           std::size_t num_additional_bytes = session->request->streambuf->size() - bytes_transferred;
 
+          if(on_request_header) {
+            auto &raw = session->request->raw_header;
+            raw.resize(bytes_transferred);
+            asio::buffer_copy(asio::buffer(raw), session->request->streambuf->data(), bytes_transferred);
+          }
+
           std::istream istream(session->request->streambuf.get());
           if(!RequestMessage::parse(istream, session->request->method, session->request->path,
                                     session->request->query_string, session->request->http_version, session->request->header)) {
             if(this->on_error)
               this->on_error(session->request, make_error_code::make_error_code(errc::protocol_error));
+            return;
+          }
+
+          if(on_request_header && !on_request_header(session->request)) {
+            session->connection->close();
             return;
           }
 
@@ -600,7 +640,7 @@ namespace SimpleWeb {
                 this->on_error(session->request, make_error_code::make_error_code(errc::protocol_error));
               return;
             }
-            if(content_length > session->request->streambuf->max_size()) {
+            if(content_length > session->request->content_streambuf.max_size()) {
               auto response = std::shared_ptr<Response>(new Response(session, this->config.timeout_content));
               response->write(StatusCode::client_error_payload_too_large);
               if(this->on_error)
@@ -807,13 +847,13 @@ namespace SimpleWeb {
               if(case_insensitive_equal(it->second, "close"))
                 return;
               else if(case_insensitive_equal(it->second, "keep-alive")) {
-                auto new_session = std::make_shared<Session>(this->config.max_request_streambuf_size, response->session->connection, std::move(response->session->request->streambuf));
+                auto new_session = std::make_shared<Session>(this->config.max_request_streambuf_size, response->session->connection, std::move(response->session->request->streambuf), this->config.max_request_header_size);
                 this->read(new_session);
                 return;
               }
             }
             if(response->session->request->http_version >= "1.1") {
-              auto new_session = std::make_shared<Session>(this->config.max_request_streambuf_size, response->session->connection, std::move(response->session->request->streambuf));
+              auto new_session = std::make_shared<Session>(this->config.max_request_streambuf_size, response->session->connection, std::move(response->session->request->streambuf), this->config.max_request_header_size);
               this->read(new_session);
               return;
             }
@@ -858,9 +898,13 @@ namespace SimpleWeb {
         if(ec != error::operation_aborted)
           this->accept();
 
-        auto session = std::make_shared<Session>(config.max_request_streambuf_size, connection);
+        auto session = std::make_shared<Session>(config.max_request_streambuf_size, connection, config.max_request_header_size);
 
         if(!ec) {
+          if(on_connection_accepted && !on_connection_accepted(session->request)) {
+            connection->close();
+            return;
+          }
           asio::ip::tcp::no_delay option(true);
           error_code ec;
           session->connection->socket->set_option(option, ec);

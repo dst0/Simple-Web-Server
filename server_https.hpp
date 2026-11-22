@@ -73,9 +73,13 @@ namespace SimpleWeb {
         if(ec != error::operation_aborted)
           this->accept();
 
-        auto session = std::make_shared<Session>(config.max_request_streambuf_size, connection);
+        auto session = std::make_shared<Session>(config.max_request_streambuf_size, connection, config.max_request_header_size);
 
         if(!ec) {
+          if(on_connection_accepted && !on_connection_accepted(session->request)) {
+            connection->close();
+            return;
+          }
           asio::ip::tcp::no_delay option(true);
           error_code ec;
           session->connection->socket->lowest_layer().set_option(option, ec);
@@ -86,8 +90,13 @@ namespace SimpleWeb {
             auto lock = session->connection->handler_runner->continue_lock();
             if(!lock)
               return;
-            if(!ec)
+            if(!ec) {
+              if(on_connection_authenticated && !on_connection_authenticated(session->request)) {
+                session->connection->close();
+                return;
+              }
               this->read(session);
+            }
             else if(this->on_error)
               this->on_error(session->request, ec);
           });
