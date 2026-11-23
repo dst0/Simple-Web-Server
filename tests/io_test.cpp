@@ -744,4 +744,75 @@ int main() {
     ASSERT(client_catch);
     io_service->stop();
   }
+
+  // Test strict chunked transfer decoding bounds & error handling
+  {
+    auto test_raw_request = [](const std::string &raw_request, std::size_t max_streambuf, bool register_error_cb, bool check_ec, SimpleWeb::error_code expected_ec) {
+      HttpServer server;
+      server.config.port = 0;
+      server.config.timeout_request = 2;
+      server.config.max_request_streambuf_size = max_streambuf;
+      std::atomic<bool> handled(false);
+      std::atomic<bool> saw_error(false);
+      SimpleWeb::error_code captured_ec;
+      std::mutex ec_mutex;
+      if(register_error_cb) {
+        server.on_error = [&saw_error, &captured_ec, &ec_mutex](shared_ptr<HttpServer::Request>, const SimpleWeb::error_code &ec) {
+          std::lock_guard<std::mutex> lock(ec_mutex);
+          if(!saw_error.exchange(true))
+            captured_ec = ec;
+        };
+      }
+      server.resource["^/chunk$"]["POST"] = [&handled](shared_ptr<HttpServer::Response> response, shared_ptr<HttpServer::Request>) {
+        handled = true;
+        response->write("unexpected");
+      };
+      promise<unsigned short> port_promise;
+      thread server_thread([&server, &port_promise] {
+        server.start([&port_promise](unsigned short p) {
+          port_promise.set_value(p);
+        });
+      });
+      auto port = port_promise.get_future().get();
+
+      SimpleWeb::asio::io_context client_io;
+      SimpleWeb::asio::ip::tcp::socket sock(client_io);
+      sock.connect({SimpleWeb::asio::ip::make_address("127.0.0.1"), port});
+      SimpleWeb::asio::write(sock, SimpleWeb::asio::buffer(raw_request));
+      SimpleWeb::error_code read_ec;
+      char buf[256];
+      for(;;) {
+        sock.read_some(SimpleWeb::asio::buffer(buf), read_ec);
+        if(read_ec)
+          break;
+      }
+      sock.close();
+      ASSERT(!handled);
+      if(register_error_cb) {
+        ASSERT(saw_error);
+        if(check_ec) {
+          std::lock_guard<std::mutex> lock(ec_mutex);
+          ASSERT(captured_ec == expected_ec);
+        }
+      }
+      server.stop();
+      server_thread.join();
+    };
+
+    const std::string chunk_hdr = "POST /chunk HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const auto msg_size_ec = SimpleWeb::make_error_code::make_error_code(SimpleWeb::errc::message_size);
+    const auto proto_ec = SimpleWeb::make_error_code::make_error_code(SimpleWeb::errc::protocol_error);
+    // Integer overflow attempt (ffffffffffffffff would wrap if added to non-zero size())
+    test_raw_request(chunk_hdr + "4\r\nbody\r\nffffffffffffffff\r\n", 1024, true, true, msg_size_ec);
+    // Overflow past max_request_streambuf_size without registering on_error (must not crash)
+    test_raw_request(chunk_hdr + "4000\r\n", 1024, false, false, SimpleWeb::error_code());
+    // Reject signed, whitespace-prefixed, bare-LF, and >16 hex digit chunk sizes
+    test_raw_request(chunk_hdr + "+5\r\nhello\r\n0\r\n\r\n", 1024, true, true, proto_ec);
+    test_raw_request(chunk_hdr + " 5\r\nhello\r\n0\r\n\r\n", 1024, true, true, proto_ec);
+    test_raw_request(chunk_hdr + "00000000000000005\r\nhello\r\n0\r\n\r\n", 1024, true, true, proto_ec);
+    test_raw_request(chunk_hdr + "5\nhello\r\n0\r\n\r\n", 1024, true, true, proto_ec);
+    // Reject bare-LF and non-colon header lines over live socket
+    test_raw_request("POST /chunk HTTP/1.1\nHost: localhost\r\n\r\n", 1024, true, true, proto_ec);
+    test_raw_request("POST /chunk HTTP/1.1\r\nBrokenHeader\r\n\r\n", 1024, true, true, proto_ec);
+  }
 }

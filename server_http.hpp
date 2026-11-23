@@ -239,7 +239,7 @@ namespace SimpleWeb {
       std::weak_ptr<Connection> connection;
       std::string optimization = std::to_string(0); // TODO: figure out what goes wrong in gcc optimization without this line
 
-      Request(std::size_t max_request_streambuf_size, const std::shared_ptr<Connection> &connection_, std::size_t max_header_size) noexcept
+      Request(std::size_t max_request_streambuf_size, const std::shared_ptr<Connection> &connection_, std::size_t max_header_size = static_cast<std::size_t>(-1)) noexcept
           : streambuf(new asio::streambuf(std::min(max_request_streambuf_size, max_header_size))), content_streambuf(max_request_streambuf_size), connection(connection_), content(content_streambuf) {}
       Request(std::size_t max_request_streambuf_size, const std::shared_ptr<Connection> &connection_, std::unique_ptr<asio::streambuf> &&previous_streambuf, std::size_t) noexcept
           : streambuf(std::move(previous_streambuf)), content_streambuf(max_request_streambuf_size), connection(connection_), content(content_streambuf) {
@@ -703,9 +703,34 @@ namespace SimpleWeb {
           std::string line;
           std::getline(istream, line);
           bytes_transferred -= line.size() + 1;
-          unsigned long chunk_size = 0;
+          if(istream.eof() || line.empty() || line.back() != '\r') {
+            if(this->on_error)
+              this->on_error(session->request, make_error_code::make_error_code(errc::protocol_error));
+            return;
+          }
+          line.pop_back();
+          if(line.find('\r') != std::string::npos || line.find('\0') != std::string::npos) {
+            if(this->on_error)
+              this->on_error(session->request, make_error_code::make_error_code(errc::protocol_error));
+            return;
+          }
+          const auto semicolon_pos = line.find(';');
+          const auto chunk_size_str = line.substr(0, semicolon_pos);
+          bool valid_hex = !chunk_size_str.empty() && chunk_size_str.size() <= 16;
+          for(const char c : chunk_size_str) {
+            if(!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+              valid_hex = false;
+              break;
+            }
+          }
+          if(!valid_hex) {
+            if(this->on_error)
+              this->on_error(session->request, make_error_code::make_error_code(errc::protocol_error));
+            return;
+          }
+          unsigned long long chunk_size = 0;
           try {
-            chunk_size = std::stoul(line, 0, 16);
+            chunk_size = std::stoull(chunk_size_str, nullptr, 16);
           }
           catch(...) {
             if(this->on_error)
@@ -713,7 +738,7 @@ namespace SimpleWeb {
             return;
           }
 
-          if(chunk_size + session->request->content_streambuf.size() > session->request->content_streambuf.max_size()) {
+          if(chunk_size > session->request->content_streambuf.max_size() - session->request->content_streambuf.size()) {
             auto response = std::shared_ptr<Response>(new Response(session, this->config.timeout_content));
             response->write(StatusCode::client_error_payload_too_large);
             if(this->on_error)
@@ -738,7 +763,7 @@ namespace SimpleWeb {
 
           auto num_additional_bytes = chunk_size_streambuf->size() - bytes_transferred;
 
-          auto bytes_to_move = std::min<std::size_t>(chunk_size, num_additional_bytes);
+          auto bytes_to_move = std::min<std::size_t>(static_cast<std::size_t>(chunk_size), num_additional_bytes);
           if(bytes_to_move > 0) {
             // Move leftover bytes
             auto &source = *chunk_size_streambuf;
@@ -748,7 +773,7 @@ namespace SimpleWeb {
           }
 
           if(chunk_size > num_additional_bytes) {
-            asio::async_read(*session->connection->socket, session->request->content_streambuf, asio::transfer_exactly(chunk_size - num_additional_bytes), [this, session, chunk_size_streambuf, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
+            asio::async_read(*session->connection->socket, session->request->content_streambuf, asio::transfer_exactly(static_cast<std::size_t>(chunk_size) - num_additional_bytes), [this, session, chunk_size_streambuf, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
               auto lock = session->connection->handler_runner->continue_lock();
               if(!lock)
                 return;
@@ -762,7 +787,7 @@ namespace SimpleWeb {
                     return;
                   if(!ec)
                     read_next(session, chunk_size_streambuf);
-                  else
+                  else if(this->on_error)
                     this->on_error(session->request, ec);
                 });
               }
@@ -770,18 +795,18 @@ namespace SimpleWeb {
                 this->on_error(session->request, ec);
             });
           }
-          else if(2 + chunk_size > num_additional_bytes) { // If only end of chunk remains unread (\n or \r\n)
+          else if(2 + static_cast<std::size_t>(chunk_size) > num_additional_bytes) { // If only end of chunk remains unread (\n or \r\n)
             // Remove "\r\n"
-            if(2 + chunk_size - num_additional_bytes == 1)
+            if(2 + static_cast<std::size_t>(chunk_size) - num_additional_bytes == 1)
               istream.get();
             auto null_buffer = std::make_shared<asio::streambuf>(2);
-            asio::async_read(*session->connection->socket, *null_buffer, asio::transfer_exactly(2 + chunk_size - num_additional_bytes), [this, session, chunk_size_streambuf, null_buffer, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
+            asio::async_read(*session->connection->socket, *null_buffer, asio::transfer_exactly(2 + static_cast<std::size_t>(chunk_size) - num_additional_bytes), [this, session, chunk_size_streambuf, null_buffer, read_next](const error_code &ec, size_t /*bytes_transferred*/) {
               auto lock = session->connection->handler_runner->continue_lock();
               if(!lock)
                 return;
               if(!ec)
                 read_next(session, chunk_size_streambuf);
-              else
+              else if(this->on_error)
                 this->on_error(session->request, ec);
             });
           }

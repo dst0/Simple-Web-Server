@@ -37,6 +37,11 @@ namespace SimpleWeb {
 #else
           context(asio::ssl::context::tlsv12) {
 #endif
+      SSL_CTX_set_min_proto_version(context.native_handle(), TLS1_3_VERSION);
+      SSL_CTX_set_options(context.native_handle(), SSL_OP_NO_RENEGOTIATION);
+      if(SSL_CTX_set1_groups_list(context.native_handle(), "X25519MLKEM768") != 1) {
+        SSL_CTX_set1_groups_list(context.native_handle(), "X25519:P-256");
+      }
 
       context.use_certificate_chain_file(certification_file);
       context.use_private_key_file(private_key_file, asio::ssl::context::pem);

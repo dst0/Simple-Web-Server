@@ -164,8 +164,45 @@ namespace SimpleWeb {
 
   class HttpHeader {
   public:
+    /// Parse header fields strictly from stream (requires CRLF, rejects NUL/bare CR/LF and non-empty lines without ':')
+    static bool parse(std::istream &stream, CaseInsensitiveMultimap &result) noexcept {
+      result.clear();
+      std::string line;
+      while(getline(stream, line)) {
+        if(stream.eof() || line.empty() || line.back() != '\r') {
+          result.clear();
+          return false;
+        }
+        line.pop_back();
+        if(line.find('\r') != std::string::npos || line.find('\0') != std::string::npos) {
+          result.clear();
+          return false;
+        }
+        if(line.empty())
+          return true;
+        const std::size_t param_end = line.find(':');
+        if(param_end == std::string::npos) {
+          result.clear();
+          return false;
+        }
+        std::size_t value_start = param_end + 1;
+        while(value_start < line.size() && line[value_start] == ' ')
+          ++value_start;
+        result.emplace(line.substr(0, param_end), line.substr(value_start));
+      }
+      return stream.eof();
+    }
+
     /// Parse header fields from stream
     static CaseInsensitiveMultimap parse(std::istream &stream) noexcept {
+      CaseInsensitiveMultimap result;
+      if(!parse(stream, result))
+        return {};
+      return result;
+    }
+
+    /// Parse response header fields, tolerating legacy servers with non-standard line endings
+    static CaseInsensitiveMultimap parse_lenient(std::istream &stream) noexcept {
       CaseInsensitiveMultimap result;
       std::string line;
       std::size_t param_end;
@@ -254,37 +291,45 @@ namespace SimpleWeb {
     static bool parse(std::istream &stream, std::string &method, std::string &path, std::string &query_string, std::string &version, CaseInsensitiveMultimap &header) noexcept {
       std::string line;
       std::size_t method_end;
-      if(getline(stream, line) && (method_end = line.find(' ')) != std::string::npos) {
-        method = line.substr(0, method_end);
+      if(getline(stream, line) && !stream.eof() && !line.empty() && line.back() == '\r') {
+        line.pop_back();
+        if(line.find('\r') != std::string::npos || line.find('\0') != std::string::npos)
+          return false;
+        if((method_end = line.find(' ')) != std::string::npos) {
+          method = line.substr(0, method_end);
 
-        std::size_t query_start = std::string::npos;
-        std::size_t path_and_query_string_end = std::string::npos;
-        for(std::size_t i = method_end + 1; i < line.size(); ++i) {
-          if(line[i] == '?' && (i + 1) < line.size() && query_start == std::string::npos)
-            query_start = i + 1;
-          else if(line[i] == ' ') {
-            path_and_query_string_end = i;
-            break;
+          std::size_t query_start = std::string::npos;
+          std::size_t path_and_query_string_end = std::string::npos;
+          for(std::size_t i = method_end + 1; i < line.size(); ++i) {
+            if(line[i] == '?' && (i + 1) < line.size() && query_start == std::string::npos)
+              query_start = i + 1;
+            else if(line[i] == ' ') {
+              path_and_query_string_end = i;
+              break;
+            }
           }
-        }
-        if(path_and_query_string_end != std::string::npos) {
-          if(query_start != std::string::npos) {
-            path = line.substr(method_end + 1, query_start - method_end - 2);
-            query_string = line.substr(query_start, path_and_query_string_end - query_start);
-          }
-          else
-            path = line.substr(method_end + 1, path_and_query_string_end - method_end - 1);
+          if(path_and_query_string_end != std::string::npos) {
+            if(query_start != std::string::npos) {
+              path = line.substr(method_end + 1, query_start - method_end - 2);
+              query_string = line.substr(query_start, path_and_query_string_end - query_start);
+            }
+            else
+              path = line.substr(method_end + 1, path_and_query_string_end - method_end - 1);
 
-          std::size_t protocol_end;
-          if((protocol_end = line.find('/', path_and_query_string_end + 1)) != std::string::npos) {
-            if(line.compare(path_and_query_string_end + 1, protocol_end - path_and_query_string_end - 1, "HTTP") != 0)
+            std::size_t protocol_end;
+            if((protocol_end = line.find('/', path_and_query_string_end + 1)) != std::string::npos) {
+              if(line.compare(path_and_query_string_end + 1, protocol_end - path_and_query_string_end - 1, "HTTP") != 0)
+                return false;
+              version = line.substr(protocol_end + 1);
+            }
+            else
               return false;
-            version = line.substr(protocol_end + 1, line.size() - protocol_end - 2);
+
+            if(!HttpHeader::parse(stream, header))
+              return false;
           }
           else
             return false;
-
-          header = HttpHeader::parse(stream);
         }
         else
           return false;
@@ -319,7 +364,7 @@ namespace SimpleWeb {
         else
           return false;
 
-        header = HttpHeader::parse(stream);
+        header = HttpHeader::parse_lenient(stream);
       }
       else
         return false;

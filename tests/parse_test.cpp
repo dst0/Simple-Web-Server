@@ -223,16 +223,22 @@ int main() {
     ASSERT(parsed == solution);
   }
   {
-    SimpleWeb::CaseInsensitiveMultimap solution = {{"Content-Type", "application/json"}};
+    SimpleWeb::CaseInsensitiveMultimap solution;
     std::stringstream header("Content-Type: application/json");
     auto parsed = SimpleWeb::HttpHeader::parse(header);
     ASSERT(parsed == solution);
+    header.clear();
+    header.str("Content-Type: application/json");
+    ASSERT(!SimpleWeb::HttpHeader::parse(header, parsed));
   }
   {
-    SimpleWeb::CaseInsensitiveMultimap solution = {{"Content-Type", "application/json"}};
+    SimpleWeb::CaseInsensitiveMultimap solution;
     std::stringstream header("Content-Type: application/json\r");
     auto parsed = SimpleWeb::HttpHeader::parse(header);
     ASSERT(parsed == solution);
+    header.clear();
+    header.str("Content-Type: application/json\r");
+    ASSERT(!SimpleWeb::HttpHeader::parse(header, parsed));
   }
   {
     SimpleWeb::CaseInsensitiveMultimap solution = {{"Content-Type", "application/json"}};
@@ -334,6 +340,46 @@ int main() {
         auto parsed = SimpleWeb::HttpHeader::FieldValue::SemicolonSeparatedAttributes::parse("form-data; name=fi%20le; filename=file%20name.png");
         ASSERT(parsed == solution);
       }
+    }
+  }
+
+  {
+    SimpleWeb::CaseInsensitiveMultimap parsed;
+    {
+      std::stringstream ss("Host: localhost\n\r\n");
+      ASSERT(!SimpleWeb::HttpHeader::parse(ss, parsed));
+    }
+    {
+      std::stringstream ss("Host: local\rhost\r\n\r\n");
+      ASSERT(!SimpleWeb::HttpHeader::parse(ss, parsed));
+    }
+    {
+      std::stringstream ss(std::string("Host: local\0host\r\n\r\n", 20));
+      ASSERT(!SimpleWeb::HttpHeader::parse(ss, parsed));
+    }
+    {
+      std::stringstream ss("MalformedHeaderWithoutColon\r\n\r\n");
+      ASSERT(!SimpleWeb::HttpHeader::parse(ss, parsed));
+    }
+    {
+      std::stringstream ss("Host: localhost\r\nX-Test: ok\r\n\r\n");
+      ASSERT(SimpleWeb::HttpHeader::parse(ss, parsed));
+      ASSERT(parsed.size() == 2);
+    }
+    {
+      std::string method, path, query_string, version;
+      SimpleWeb::CaseInsensitiveMultimap header;
+      std::stringstream bare_lf("GET / HTTP/1.1\nHost: localhost\r\n\r\n");
+      ASSERT(!SimpleWeb::RequestMessage::parse(bare_lf, method, path, query_string, version, header));
+
+      std::stringstream bare_cr("GET / HTTP/1.1\rHost: localhost\r\n\r\n");
+      ASSERT(!SimpleWeb::RequestMessage::parse(bare_cr, method, path, query_string, version, header));
+
+      std::stringstream nul_req(std::string("GET /\0 HTTP/1.1\r\nHost: localhost\r\n\r\n", 36));
+      ASSERT(!SimpleWeb::RequestMessage::parse(nul_req, method, path, query_string, version, header));
+
+      std::stringstream bad_hdr("GET / HTTP/1.1\r\nNoColonHere\r\n\r\n");
+      ASSERT(!SimpleWeb::RequestMessage::parse(bad_hdr, method, path, query_string, version, header));
     }
   }
 
